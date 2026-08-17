@@ -1,2 +1,2 @@
-# omni-commerce
-Fastify multi-store retail e-commerce backend
+# OmniCommerce Backend Service
+Fastify-based retail backend coordinating PostgreSQL, MongoDB, Redis, and Kafka.
