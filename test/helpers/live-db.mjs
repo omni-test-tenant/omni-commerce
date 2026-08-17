@@ -11,6 +11,10 @@ export async function createLiveTestStores() {
 
   const stores = {};
   const cleanups = [];
+  // Connection failures are recorded rather than swallowed. A silent catch turns
+  // "the broker was unreachable" into an indistinguishable "store is absent", which
+  // is the difference between a diagnosable failure and a mystery.
+  const connectionErrors = {};
 
   // 1. Live PostgreSQL Client
   try {
@@ -38,7 +42,7 @@ export async function createLiveTestStores() {
       await pg.end().catch(() => {});
     });
   } catch (err) {
-    // Falls back only if no live PG available
+    connectionErrors.postgres = err.message;
   }
 
   // 2. Live MongoDB Client
@@ -51,7 +55,9 @@ export async function createLiveTestStores() {
       await db.collection("product_catalogs").drop().catch(() => {});
       await mongo.close().catch(() => {});
     });
-  } catch (err) {}
+  } catch (err) {
+    connectionErrors.mongodb = err.message;
+  }
 
   // 3. Live Redis Client
   try {
@@ -62,7 +68,9 @@ export async function createLiveTestStores() {
     cleanups.push(async () => {
       await redis.quit().catch(() => redis.disconnect());
     });
-  } catch (err) {}
+  } catch (err) {
+    connectionErrors.redis = err.message;
+  }
 
   // 4. Live Kafka Client
   try {
@@ -81,10 +89,22 @@ export async function createLiveTestStores() {
     cleanups.push(async () => {
       await producer.disconnect().catch(() => {});
     });
-  } catch (err) {}
+  } catch (err) {
+    connectionErrors.kafka = err.message;
+  }
 
   return {
     stores,
+    connectionErrors,
+    /** Throw with the underlying cause when a required engine is missing. */
+    require(...names) {
+      const missing = names.filter((n) => !stores[n]);
+      if (missing.length > 0) {
+        const detail = missing.map((n) => `${n}: ${connectionErrors[n] ?? "not configured"}`).join("; ");
+        throw new Error(`Live test stores unavailable -> ${detail}`);
+      }
+      return stores;
+    },
     cleanup: async () => {
       for (const fn of cleanups.reverse()) {
         await fn().catch(() => {});
