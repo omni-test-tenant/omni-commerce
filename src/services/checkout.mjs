@@ -16,6 +16,8 @@ export class CheckoutService {
 
     const orderId = `ord-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
     const orderNumber = `ORD-${orderId}`;
+    let mongoStockDecremented = false;
+    let postgresCommitted = false;
 
     // 1. Session Validation in Redis
     if (this.stores.redis) {
@@ -24,12 +26,12 @@ export class CheckoutService {
         throw new InvalidSessionError(userId);
       }
 
-      // Acquire Cart Concurrency Lock (5-second TTL)
+      // Acquire Cart Concurrency Lock (30-second TTL to avoid premature expiry under load)
       const lockAcquired = await this.stores.redis.set(
         `lock:cart:${userId}`,
         orderId,
         "PX",
-        5000,
+        30000,
         "NX"
       );
       if (!lockAcquired) {
@@ -54,6 +56,7 @@ export class CheckoutService {
         if (!updatedDoc || (!updatedDoc.sku && updateResult?.lastErrorObject?.n === 0)) {
           throw new OutOfStockError(sku, quantity);
         }
+        mongoStockDecremented = true;
       }
 
       // 3. PostgreSQL Relational Transaction
@@ -69,10 +72,11 @@ export class CheckoutService {
             [`item-${orderId}-1`, orderId, sku, quantity, Math.floor(amountCents / quantity)]
           );
           await this.stores.postgres.query("COMMIT");
+          postgresCommitted = true;
         } catch (pgErr) {
           await this.stores.postgres.query("ROLLBACK").catch(() => {});
           // Compensating Transaction: Restore MongoDB inventory
-          if (this.stores.mongodb) {
+          if (mongoStockDecremented && this.stores.mongodb) {
             const collection = typeof this.stores.mongodb.collection === "function"
               ? this.stores.mongodb.collection("product_catalogs")
               : this.stores.mongodb;
@@ -80,31 +84,54 @@ export class CheckoutService {
               { sku },
               { $inc: { stockQuantity: quantity } }
             ).catch(() => {});
+            mongoStockDecremented = false;
           }
           throw pgErr;
         }
       }
 
-      // 4. Kafka Event Stream Emission
+      // 4. Kafka Event Stream Emission with Distributed Compensation on Failure
       if (this.stores.kafka) {
-        await this.stores.kafka.send({
-          topic: "omnicommerce.order-events",
-          messages: [
-            {
-              key: userId,
-              value: JSON.stringify({
-                eventType: "OrderCreated",
-                orderId,
-                orderNumber,
-                userId,
-                sku,
-                quantity,
-                amountCents,
-                createdAt: new Date().toISOString()
-              })
-            }
-          ]
-        });
+        try {
+          await this.stores.kafka.send({
+            topic: "omnicommerce.order-events",
+            messages: [
+              {
+                key: userId,
+                value: JSON.stringify({
+                  eventType: "OrderCreated",
+                  orderId,
+                  orderNumber,
+                  userId,
+                  sku,
+                  quantity,
+                  amountCents,
+                  createdAt: new Date().toISOString()
+                })
+              }
+            ]
+          });
+        } catch (kafkaErr) {
+          // Compensate committed Postgres transaction
+          if (postgresCommitted && this.stores.postgres) {
+            await this.stores.postgres.query(
+              "UPDATE orders SET status = 'failed' WHERE id = $1",
+              [orderId]
+            ).catch(() => {});
+          }
+          // Compensate MongoDB inventory
+          if (mongoStockDecremented && this.stores.mongodb) {
+            const collection = typeof this.stores.mongodb.collection === "function"
+              ? this.stores.mongodb.collection("product_catalogs")
+              : this.stores.mongodb;
+            await collection.updateOne(
+              { sku },
+              { $inc: { stockQuantity: quantity } }
+            ).catch(() => {});
+            mongoStockDecremented = false;
+          }
+          throw kafkaErr;
+        }
       }
 
       return {
@@ -117,9 +144,16 @@ export class CheckoutService {
         quantity
       };
     } finally {
-      // Release Cart Concurrency Lock
+      // Release Cart Concurrency Lock safely (only if holding token)
       if (this.stores.redis) {
-        await this.stores.redis.del(`lock:cart:${userId}`).catch(() => {});
+        try {
+          const currentToken = await this.stores.redis.get?.(`lock:cart:${userId}`);
+          if (!currentToken || currentToken === orderId) {
+            await this.stores.redis.del(`lock:cart:${userId}`);
+          }
+        } catch {
+          await this.stores.redis.del(`lock:cart:${userId}`).catch(() => {});
+        }
       }
     }
   }

@@ -50,6 +50,103 @@ test("CheckoutService processes valid order across 5-store dependencies", async 
   assert.equal(stock, 4);
 });
 
+test("CheckoutService performs distributed compensation on Kafka failure", async () => {
+  let stock = 5;
+  const pgQueries = [];
+  const mockStores = {
+    redis: {
+      hgetall: async () => ({ authenticated: "true" }),
+      set: async () => "OK",
+      del: async () => 1
+    },
+    mongodb: {
+      collection: () => ({
+        findOneAndUpdate: async ({ sku, stockQuantity }, update) => {
+          stock += update.$inc.stockQuantity;
+          return { sku, stockQuantity: stock };
+        },
+        updateOne: async ({ sku }, update) => {
+          stock += update.$inc.stockQuantity;
+          return { modifiedCount: 1 };
+        }
+      })
+    },
+    postgres: {
+      query: async (sql, params) => {
+        pgQueries.push({ sql, params });
+        return { rowCount: 1 };
+      }
+    },
+    kafka: {
+      send: async () => {
+        throw new Error("Kafka broker connection failure");
+      }
+    }
+  };
+
+  const checkout = new CheckoutService(mockStores);
+  await assert.rejects(
+    () => checkout.processCheckout({
+      userId: "u-kafka-fail",
+      sku: "SKU-KAFKA-COMPENSATE",
+      quantity: 1,
+      amountCents: 9999
+    }),
+    /Kafka broker connection failure/
+  );
+
+  // MongoDB inventory must be fully restored to 5
+  assert.equal(stock, 5);
+  // PostgreSQL must have executed compensating status update to 'failed'
+  const failedQuery = pgQueries.find((q) => q.sql.includes("UPDATE orders SET status = 'failed'"));
+  assert.ok(failedQuery, "PostgreSQL compensating query was executed");
+});
+
+test("CheckoutService performs distributed compensation on PostgreSQL failure", async () => {
+  let stock = 5;
+  const mockStores = {
+    redis: {
+      hgetall: async () => ({ authenticated: "true" }),
+      set: async () => "OK",
+      del: async () => 1
+    },
+    mongodb: {
+      collection: () => ({
+        findOneAndUpdate: async ({ sku, stockQuantity }, update) => {
+          stock += update.$inc.stockQuantity;
+          return { sku, stockQuantity: stock };
+        },
+        updateOne: async ({ sku }, update) => {
+          stock += update.$inc.stockQuantity;
+          return { modifiedCount: 1 };
+        }
+      })
+    },
+    postgres: {
+      query: async (sql) => {
+        if (sql.includes("INSERT INTO orders")) {
+          throw new Error("PostgreSQL unique constraint violation");
+        }
+        return { rowCount: 1 };
+      }
+    }
+  };
+
+  const checkout = new CheckoutService(mockStores);
+  await assert.rejects(
+    () => checkout.processCheckout({
+      userId: "u-pg-fail",
+      sku: "SKU-PG-COMPENSATE",
+      quantity: 1,
+      amountCents: 9999
+    }),
+    /PostgreSQL unique constraint violation/
+  );
+
+  // MongoDB inventory must be restored to 5
+  assert.equal(stock, 5);
+});
+
 test("CheckoutService rejects unauthenticated session with InvalidSessionError (401)", async () => {
   const mockStores = {
     redis: {
@@ -95,7 +192,30 @@ test("CheckoutService rejects out-of-stock item with OutOfStockError (409)", asy
   );
 });
 
-test("Fastify server integrates typed errors and returns exact HTTP 409 / 401 status codes", async () => {
+test("CheckoutService throws ConcurrencyLockError (423) when cart lock collision occurs", async () => {
+  const mockStores = {
+    redis: {
+      hgetall: async () => ({ authenticated: "true" }),
+      set: async (k, v, px, ttl, nx) => {
+        if (nx) return null; // Lock cannot be acquired
+        return "OK";
+      }
+    }
+  };
+
+  const checkout = new CheckoutService(mockStores);
+  await assert.rejects(
+    () => checkout.processCheckout({
+      userId: "u-locked",
+      sku: "SKU-LOCKED",
+      quantity: 1,
+      amountCents: 5000
+    }),
+    ConcurrencyLockError
+  );
+});
+
+test("Fastify server integrates typed errors and returns exact HTTP 409 / 401 / 423 status codes", async () => {
   const mockStores = {
     redis: {
       hgetall: async (k) => k === "session:valid-user" ? { authenticated: "true" } : null,

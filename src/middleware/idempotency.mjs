@@ -57,8 +57,8 @@ export function registerIdempotencyMiddleware(fastify, { redisClient } = {}) {
         86400000
       );
     } else {
-      // On non-success, release processing key so client can retry
-      await redisClient.del(redisKey);
+      // On non-success, release processing key immediately so client can retry
+      await redisClient.del(redisKey).catch(() => {});
     }
     return payload;
   });
@@ -67,6 +67,22 @@ export function registerIdempotencyMiddleware(fastify, { redisClient } = {}) {
     const idempotencyKey = request.idempotencyKey;
     if (idempotencyKey && redisClient) {
       await redisClient.del(`idempotency:${idempotencyKey}`).catch(() => {});
+    }
+  });
+
+  fastify.addHook("onResponse", async (request, reply) => {
+    const idempotencyKey = request.idempotencyKey;
+    if (idempotencyKey && redisClient && reply.statusCode >= 400) {
+      const redisKey = `idempotency:${idempotencyKey}`;
+      const existing = await redisClient.get(redisKey).catch(() => null);
+      if (existing) {
+        try {
+          const parsed = JSON.parse(existing);
+          if (parsed.state === "PROCESSING") {
+            await redisClient.del(redisKey).catch(() => {});
+          }
+        } catch {}
+      }
     }
   });
 }
