@@ -58,20 +58,17 @@ test("Fastify Error Handler maps typed errors to exact HTTP status codes", async
   assert.equal(resIdemp.json().error, "IdempotencyConflictError");
 });
 
-test("Live Zero-Mock Multi-Store Checkout: executes against real database drivers when available", async (t) => {
+test("Live Zero-Mock: processCheckout executes against real PostgreSQL, MongoDB, and Redis", async () => {
   const { stores, cleanup } = await createLiveTestStores();
 
   try {
-    if (!stores.postgres || !stores.mongodb || !stores.redis) {
-      t.skip("Live database services not reachable on local ports - skipping live store run");
-      return;
-    }
+    assert.ok(stores.postgres, "Real PostgreSQL connected");
+    assert.ok(stores.mongodb, "Real MongoDB connected");
+    assert.ok(stores.redis, "Real Redis connected");
 
-    // Seed session in real Redis
     const userId = "u1000000-0000-4000-8000-000000000001";
     await stores.redis.hset(`session:${userId}`, "authenticated", "true", "role", "customer");
 
-    // Seed inventory in real MongoDB
     await stores.mongodb.collection("product_catalogs").insertOne({
       sku: "SKU-OMNI-4K-TV",
       stockQuantity: 5,
@@ -79,25 +76,99 @@ test("Live Zero-Mock Multi-Store Checkout: executes against real database driver
     });
 
     const checkout = new CheckoutService(stores);
+
+    // 1. Successful checkout
     const result = await checkout.processCheckout({
       userId,
       sku: "SKU-OMNI-4K-TV",
-      quantity: 1,
-      amountCents: 14999
+      quantity: 2,
+      amountCents: 29998
     });
 
     assert.equal(result.success, true);
     assert.equal(result.status, "paid");
-    assert.equal(result.totalAmountCents, 14999);
 
-    // Verify stock decreased to 4 in real MongoDB
-    const updatedMongoDoc = await stores.mongodb.collection("product_catalogs").findOne({ sku: "SKU-OMNI-4K-TV" });
-    assert.equal(updatedMongoDoc.stockQuantity, 4);
+    // Stock in real MongoDB decremented from 5 to 3
+    const mongoDoc = await stores.mongodb.collection("product_catalogs").findOne({ sku: "SKU-OMNI-4K-TV" });
+    assert.equal(mongoDoc.stockQuantity, 3);
 
-    // Verify row created in real PostgreSQL
+    // Order created in real PostgreSQL
     const pgRes = await stores.postgres.query("SELECT * FROM orders WHERE id = $1", [result.orderId]);
     assert.equal(pgRes.rowCount, 1);
     assert.equal(pgRes.rows[0].status, "paid");
+
+    // 2. Reject out of stock (attempting 4 when only 3 remaining)
+    await assert.rejects(
+      () => checkout.processCheckout({
+        userId,
+        sku: "SKU-OMNI-4K-TV",
+        quantity: 4,
+        amountCents: 59996
+      }),
+      OutOfStockError
+    );
+
+    // Ensure stock remained 3
+    const mongoDocAfterFail = await stores.mongodb.collection("product_catalogs").findOne({ sku: "SKU-OMNI-4K-TV" });
+    assert.equal(mongoDocAfterFail.stockQuantity, 3);
+
+    // 3. Reject unauthenticated session in real Redis
+    await assert.rejects(
+      () => checkout.processCheckout({
+        userId: "u-non-existent-user",
+        sku: "SKU-OMNI-4K-TV",
+        quantity: 1,
+        amountCents: 14999
+      }),
+      InvalidSessionError
+    );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("Live Zero-Mock: Fastify Server with Idempotency Middleware on real Redis", async () => {
+  const { stores, cleanup } = await createLiveTestStores();
+
+  try {
+    const app = buildServer({ stores, logger: false });
+    const userId = "u-idemp-user-1";
+    await stores.redis.hset(`session:${userId}`, "authenticated", "true", "role", "customer");
+
+    await stores.mongodb.collection("product_catalogs").insertOne({
+      sku: "SKU-IDEMP-TEST",
+      stockQuantity: 10,
+      priceCents: 5000
+    });
+
+    const idempotencyKey = `idemp-live-key-${Date.now()}`;
+
+    // Request 1
+    const res1 = await app.inject({
+      method: "POST",
+      url: "/api/v1/checkout",
+      headers: { "x-idempotency-key": idempotencyKey },
+      payload: { userId, sku: "SKU-IDEMP-TEST", quantity: 1, amountCents: 5000 }
+    });
+    assert.equal(res1.statusCode, 201);
+    const data1 = res1.json();
+
+    // Request 2 with same idempotency key (must return exact cached response from real Redis)
+    const res2 = await app.inject({
+      method: "POST",
+      url: "/api/v1/checkout",
+      headers: { "x-idempotency-key": idempotencyKey },
+      payload: { userId, sku: "SKU-IDEMP-TEST", quantity: 1, amountCents: 5000 }
+    });
+    assert.equal(res2.statusCode, 201);
+    const data2 = res2.json();
+
+    assert.equal(data2.orderId, data1.orderId);
+    assert.equal(data2.orderNumber, data1.orderNumber);
+
+    // Verify stock in real MongoDB only decremented by 1 (from 10 to 9)
+    const doc = await stores.mongodb.collection("product_catalogs").findOne({ sku: "SKU-IDEMP-TEST" });
+    assert.equal(doc.stockQuantity, 9);
   } finally {
     await cleanup();
   }
