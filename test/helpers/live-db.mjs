@@ -66,8 +66,16 @@ export async function createLiveTestStores() {
 
   // 4. Live Kafka Client
   try {
-    const kafka = new Kafka({ clientId: `omni-test-${Date.now()}`, brokers: kafkaBrokers, retry: { retries: 0 } });
-    const producer = kafka.producer();
+    const kafka = new Kafka({ clientId: `omni-test-${Date.now()}`, brokers: kafkaBrokers, retry: { retries: 5 } });
+    const admin = kafka.admin();
+    await admin.connect();
+    await admin.createTopics({
+      topics: [{ topic: "omnicommerce.order-events", numPartitions: 1, replicationFactor: 1 }],
+      waitForLeaders: true
+    }).catch(() => {});
+    await admin.disconnect();
+
+    const producer = kafka.producer({ retry: { retries: 5 } });
     await producer.connect();
     stores.kafka = producer;
     cleanups.push(async () => {

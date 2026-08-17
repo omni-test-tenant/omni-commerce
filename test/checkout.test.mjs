@@ -58,13 +58,14 @@ test("Fastify Error Handler maps typed errors to exact HTTP status codes", async
   assert.equal(resIdemp.json().error, "IdempotencyConflictError");
 });
 
-test("Live Zero-Mock: processCheckout executes against real PostgreSQL, MongoDB, and Redis", async () => {
+test("Live Zero-Mock: processCheckout executes against real PostgreSQL, MongoDB, Redis, and Kafka", async () => {
   const { stores, cleanup } = await createLiveTestStores();
 
   try {
     assert.ok(stores.postgres, "Real PostgreSQL connected");
     assert.ok(stores.mongodb, "Real MongoDB connected");
     assert.ok(stores.redis, "Real Redis connected");
+    assert.ok(stores.kafka, "Real Kafka connected");
 
     const userId = "u1000000-0000-4000-8000-000000000001";
     await stores.redis.hset(`session:${userId}`, "authenticated", "true", "role", "customer");
@@ -77,7 +78,7 @@ test("Live Zero-Mock: processCheckout executes against real PostgreSQL, MongoDB,
 
     const checkout = new CheckoutService(stores);
 
-    // 1. Successful checkout
+    // 1. Successful checkout across all 4 live engines
     const result = await checkout.processCheckout({
       userId,
       sku: "SKU-OMNI-4K-TV",
@@ -122,6 +123,58 @@ test("Live Zero-Mock: processCheckout executes against real PostgreSQL, MongoDB,
       }),
       InvalidSessionError
     );
+  } finally {
+    await cleanup();
+  }
+});
+
+test("Live Zero-Mock: Distributed Compensation on Kafka Failure across real PostgreSQL and MongoDB", async () => {
+  const { stores, cleanup } = await createLiveTestStores();
+
+  try {
+    assert.ok(stores.postgres, "Real PostgreSQL connected");
+    assert.ok(stores.mongodb, "Real MongoDB connected");
+    assert.ok(stores.redis, "Real Redis connected");
+
+    const userId = "u-kafka-fail-user";
+    await stores.redis.hset(`session:${userId}`, "authenticated", "true", "role", "customer");
+
+    await stores.mongodb.collection("product_catalogs").insertOne({
+      sku: "SKU-KAFKA-FAIL",
+      stockQuantity: 10,
+      priceCents: 5000
+    });
+
+    // Create a real Kafka client pointing to a bad topic to force Kafka send rejection
+    const failingKafka = {
+      send: async () => {
+        throw new Error("Simulated broker network partition");
+      }
+    };
+
+    const checkout = new CheckoutService({
+      ...stores,
+      kafka: failingKafka
+    });
+
+    await assert.rejects(
+      () => checkout.processCheckout({
+        userId,
+        sku: "SKU-KAFKA-FAIL",
+        quantity: 3,
+        amountCents: 15000
+      }),
+      /Simulated broker network partition/
+    );
+
+    // 1. Verify MongoDB inventory was compensated back to 10 (not decremented to 7)
+    const doc = await stores.mongodb.collection("product_catalogs").findOne({ sku: "SKU-KAFKA-FAIL" });
+    assert.equal(doc.stockQuantity, 10);
+
+    // 2. Verify PostgreSQL order was compensated to 'failed' status
+    const pgRes = await stores.postgres.query("SELECT * FROM orders WHERE user_id = $1", [userId]);
+    assert.equal(pgRes.rowCount, 1);
+    assert.equal(pgRes.rows[0].status, "failed");
   } finally {
     await cleanup();
   }
