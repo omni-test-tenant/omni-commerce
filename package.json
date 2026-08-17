@@ -1,0 +1,13 @@
+{
+  "name": "@omni-test-tenant/omni-commerce",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "src/index.mjs",
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test test/**/*.test.mjs"
+  },
+  "dependencies": {
+    "fastify": "^5.0.0"
+  }
+}
